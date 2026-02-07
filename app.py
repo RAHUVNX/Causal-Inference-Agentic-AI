@@ -4,6 +4,8 @@ Causal Inference Outreach Model - Interactive Web Application
 A Streamlit application for analyzing the causal impact of Rep outreach
 suggestions and actions on HCP prescription behavior (TRX / NBRX).
 
+Supports Excel (.xlsx / .xls) and CSV data uploads with dynamic column mapping.
+
 Two-stage analysis:
   Stage 1: Suggestions -> Incremental Actions
   Stage 2: Actions -> Incremental Outcomes (TRX or NBRX)
@@ -14,7 +16,6 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 from utils.data_generator import generate_outreach_data, filter_by_combo, VALID_COMBOS
 from models.causal_models import (
@@ -101,16 +102,16 @@ st.markdown(
         font-size: 0.9rem;
         margin: 0.2rem;
     }
-    .significance-yes {
-        color: #2E7D32;
-        font-weight: 700;
-    }
-    .significance-no {
-        color: #C62828;
-        font-weight: 700;
-    }
     div[data-testid="stSidebar"] {
         background: linear-gradient(180deg, #f8f9fc 0%, #e8ecf4 100%);
+    }
+    .upload-box {
+        border: 2px dashed #667eea;
+        border-radius: 12px;
+        padding: 2rem;
+        text-align: center;
+        background: #f8f9ff;
+        margin-bottom: 1rem;
     }
     </style>
     """,
@@ -125,63 +126,370 @@ def render_metric_card(title: str, value: str, css_class: str = "metric-card"):
     )
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
 
 st.sidebar.markdown("## Configuration")
 
-# Data source
-st.sidebar.markdown("### Data Source")
+# ── Data Source ──────────────────────────────────────────────────────────────
+
+st.sidebar.markdown("### 1. Upload Data")
 data_source = st.sidebar.radio(
-    "Choose data source",
-    ["Synthetic Data", "Upload CSV"],
+    "Data source",
+    ["Upload File (Excel / CSV)", "Demo with Synthetic Data"],
     index=0,
 )
 
-if data_source == "Upload CSV":
-    uploaded_file = st.sidebar.file_uploader("Upload outreach CSV", type=["csv"])
-else:
-    uploaded_file = None
+uploaded_file = None
+if data_source == "Upload File (Excel / CSV)":
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload your outreach data",
+        type=["xlsx", "xls", "csv"],
+        help="Supported formats: .xlsx, .xls, .csv",
+    )
+
+# ── Load raw data ────────────────────────────────────────────────────────────
+
+
+@st.cache_data
+def load_uploaded_file(file_data, file_name):
+    """Load uploaded file (Excel or CSV) into DataFrame."""
+    if file_name.endswith((".xlsx", ".xls")):
+        # Read all sheets, let user pick
+        xls = pd.ExcelFile(file_data)
+        return xls
+    else:
+        return pd.read_csv(file_data)
+
+
+@st.cache_data
+def load_synthetic(n_records, seed):
+    return generate_outreach_data(n_records=n_records, seed=seed)
+
+
+# Determine whether we have data yet
+df_raw = None
+using_synthetic = False
+
+if data_source == "Upload File (Excel / CSV)" and uploaded_file is not None:
+    if uploaded_file.name.endswith((".xlsx", ".xls")):
+        xls = load_uploaded_file(uploaded_file.getvalue(), uploaded_file.name)
+        sheet_names = xls.sheet_names
+        if len(sheet_names) > 1:
+            selected_sheet = st.sidebar.selectbox(
+                "Select sheet",
+                sheet_names,
+                help="Your Excel file has multiple sheets. Pick the one with outreach data.",
+            )
+        else:
+            selected_sheet = sheet_names[0]
+        df_raw = pd.read_excel(xls, sheet_name=selected_sheet)
+    else:
+        df_raw = load_uploaded_file(uploaded_file.getvalue(), uploaded_file.name)
+
+elif data_source == "Demo with Synthetic Data":
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Synthetic Data Settings")
+    n_records = st.sidebar.slider("Number of records", 2000, 20000, 8000, 1000)
+    seed = st.sidebar.number_input("Random seed", 1, 9999, 42)
+    df_raw = load_synthetic(n_records, seed)
+    using_synthetic = True
+
+# ── If no data yet, show landing page ────────────────────────────────────────
+
+if df_raw is None:
+    st.markdown('<p class="main-header">Causal Inference - HCP Outreach Model</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sub-header">Upload your Excel / CSV outreach data to get started</p>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div class="upload-box">
+            <h3>How it works</h3>
+            <p>1. Upload your Excel (.xlsx) or CSV file using the sidebar</p>
+            <p>2. Map your columns to the required fields (Rep ID, HCP ID, Suggestion Type, etc.)</p>
+            <p>3. Select a Suggestion-Action combination (e.g. All-All, Call-Call, Email-Email)</p>
+            <p>4. Choose the outcome to analyze (TRX or NBRX)</p>
+            <p>5. Run causal inference models to estimate incremental impact</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("#### Expected Data Columns")
+    st.markdown(
+        """
+        Your data should contain columns for:
+        - **Rep ID** - Sales representative identifier
+        - **HCP ID** - Healthcare professional identifier
+        - **Suggestion Type** - Type of suggestion given (Email, Call, Insights, All)
+        - **Action Type** - Type of action the rep took (Email, Call, Insights, All)
+        - **Treatment / Accepted** - Binary column: did the rep accept the suggestion? (1/0 or Yes/No)
+        - **Outcome columns** - Incremental TRX, NBRX, or action counts
+        - **Covariates** (optional) - Any additional numeric/categorical columns for confounding adjustment
+        """
+    )
+
+    st.info("Use the sidebar to upload your file or switch to 'Demo with Synthetic Data' to explore the tool.")
+    st.stop()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COLUMN MAPPING
+# ══════════════════════════════════════════════════════════════════════════════
 
 st.sidebar.markdown("---")
+st.sidebar.markdown("### 2. Map Your Columns")
 
-# Suggestion-Action combo selector
-st.sidebar.markdown("### Suggestion-Action Combination")
-combo_labels = [f"{s} - {a}" for s, a in VALID_COMBOS]
+all_cols = list(df_raw.columns)
+none_option = ["-- Not Available --"]
+
+
+def smart_default(options, keywords):
+    """Find best default column match from a list of keywords."""
+    for kw in keywords:
+        for i, col in enumerate(options):
+            if isinstance(col, str) and kw.lower() in col.lower():
+                return i
+    return 0
+
+
+# Required columns
+if using_synthetic:
+    # For synthetic data, columns are already named correctly - skip mapping
+    col_rep_id = "Rep_ID"
+    col_hcp_id = "HCP_ID"
+    col_suggestion_type = "Suggestion_Type"
+    col_action_type = "Action_Type"
+    col_treatment = "Suggestion_Accepted"
+    col_incremental_actions = "Incremental_Actions"
+    col_trx = "Incremental_TRX"
+    col_nbrx = "Incremental_NBRX"
+    # Covariates
+    available_covariates = [
+        "Rep_Experience_Years", "Territory_Size", "HCP_Specialty",
+        "HCP_Patient_Volume", "HCP_Digital_Affinity",
+    ]
+else:
+    col_rep_id = st.sidebar.selectbox(
+        "Rep ID column",
+        all_cols,
+        index=smart_default(all_cols, ["rep_id", "rep", "representative", "sales_rep"]),
+    )
+    col_hcp_id = st.sidebar.selectbox(
+        "HCP ID column",
+        all_cols,
+        index=smart_default(all_cols, ["hcp_id", "hcp", "physician", "doctor", "npi"]),
+    )
+    col_suggestion_type = st.sidebar.selectbox(
+        "Suggestion Type column",
+        all_cols,
+        index=smart_default(all_cols, ["suggestion_type", "suggestion", "sug_type", "channel_suggested"]),
+    )
+    col_action_type = st.sidebar.selectbox(
+        "Action Type column",
+        all_cols,
+        index=smart_default(all_cols, ["action_type", "action", "act_type", "channel_action"]),
+    )
+    col_treatment = st.sidebar.selectbox(
+        "Treatment column (Suggestion Accepted: 1/0)",
+        all_cols,
+        index=smart_default(all_cols, [
+            "suggestion_accepted", "accepted", "treatment", "treated", "is_accepted",
+        ]),
+        help="Binary column indicating if the rep accepted the suggestion (1=Yes, 0=No)",
+    )
+
+    # Outcome columns
+    st.sidebar.markdown("#### Outcome Columns")
+
+    outcome_cols_available = none_option + all_cols
+    col_incremental_actions = st.sidebar.selectbox(
+        "Incremental Actions column",
+        outcome_cols_available,
+        index=smart_default(outcome_cols_available, [
+            "incremental_actions", "incr_actions", "action_count", "num_actions",
+        ]),
+    )
+    if col_incremental_actions == none_option[0]:
+        col_incremental_actions = None
+
+    col_trx = st.sidebar.selectbox(
+        "Incremental TRX column",
+        outcome_cols_available,
+        index=smart_default(outcome_cols_available, [
+            "incremental_trx", "incr_trx", "delta_trx", "trx_lift", "trx",
+        ]),
+    )
+    if col_trx == none_option[0]:
+        col_trx = None
+
+    col_nbrx = st.sidebar.selectbox(
+        "Incremental NBRX column",
+        outcome_cols_available,
+        index=smart_default(outcome_cols_available, [
+            "incremental_nbrx", "incr_nbrx", "delta_nbrx", "nbrx_lift", "nbrx",
+        ]),
+    )
+    if col_nbrx == none_option[0]:
+        col_nbrx = None
+
+    # Covariates
+    st.sidebar.markdown("#### Covariates (for confounding adjustment)")
+    excluded = {col_rep_id, col_hcp_id, col_suggestion_type, col_action_type,
+                col_treatment, col_incremental_actions, col_trx, col_nbrx}
+    covariate_options = [c for c in all_cols if c not in excluded and c is not None]
+
+    available_covariates = st.sidebar.multiselect(
+        "Select covariate columns",
+        covariate_options,
+        default=covariate_options[:min(5, len(covariate_options))],
+        help="Numeric or categorical columns to control for confounding",
+    )
+
+
+# ── Standardize column names ────────────────────────────────────────────────
+
+if not using_synthetic:
+    rename_map = {
+        col_rep_id: "Rep_ID",
+        col_hcp_id: "HCP_ID",
+        col_suggestion_type: "Suggestion_Type",
+        col_action_type: "Action_Type",
+        col_treatment: "Suggestion_Accepted",
+    }
+    if col_incremental_actions:
+        rename_map[col_incremental_actions] = "Incremental_Actions"
+    if col_trx:
+        rename_map[col_trx] = "Incremental_TRX"
+    if col_nbrx:
+        rename_map[col_nbrx] = "Incremental_NBRX"
+
+    # Rename covariates to keep their original names (no rename needed)
+    # but rename the core columns for internal consistency
+    covariate_rename = {}
+    for cov in available_covariates:
+        if cov in rename_map:
+            covariate_rename[cov] = rename_map[cov]
+
+    df_full = df_raw.rename(columns=rename_map)
+
+    # Update covariate names to match renamed columns
+    available_covariates = [rename_map.get(c, c) for c in available_covariates]
+else:
+    df_full = df_raw.copy()
+
+
+# ── Validate treatment column ────────────────────────────────────────────────
+
+if "Suggestion_Accepted" in df_full.columns:
+    # Convert Yes/No, True/False, Y/N to 1/0
+    treat_col = df_full["Suggestion_Accepted"]
+    if treat_col.dtype == object:
+        mapping = {"yes": 1, "no": 0, "y": 1, "n": 0, "true": 1, "false": 0, "1": 1, "0": 0}
+        df_full["Suggestion_Accepted"] = treat_col.str.strip().str.lower().map(mapping)
+    df_full["Suggestion_Accepted"] = pd.to_numeric(df_full["Suggestion_Accepted"], errors="coerce")
+    df_full = df_full.dropna(subset=["Suggestion_Accepted"])
+    df_full["Suggestion_Accepted"] = df_full["Suggestion_Accepted"].astype(int)
+
+
+# ── Normalize suggestion/action type values ──────────────────────────────────
+
+def normalize_type_values(series):
+    """Standardize suggestion/action type values to title case."""
+    s = series.astype(str).str.strip().str.lower()
+    mapping = {
+        "email": "Email", "emails": "Email", "e-mail": "Email",
+        "call": "Call", "calls": "Call", "phone": "Call",
+        "insights": "Insights", "insight": "Insights",
+        "all": "All", "all channels": "All", "all_channels": "All",
+    }
+    return s.map(lambda x: mapping.get(x, x.title()))
+
+
+if "Suggestion_Type" in df_full.columns:
+    df_full["Suggestion_Type"] = normalize_type_values(df_full["Suggestion_Type"])
+if "Action_Type" in df_full.columns:
+    df_full["Action_Type"] = normalize_type_values(df_full["Action_Type"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALYSIS CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 3. Analysis Settings")
+
+# Build dynamic combo list from actual data values
+sug_values = sorted(df_full["Suggestion_Type"].dropna().unique().tolist())
+act_values = sorted(df_full["Action_Type"].dropna().unique().tolist())
+
+# Build all possible combos from the data, plus an "All - All" (no filter) option
+dynamic_combos = [("All", "All")]
+for s in sug_values:
+    for a in act_values:
+        if (s, a) != ("All", "All"):
+            sub = df_full[(df_full["Suggestion_Type"] == s) & (df_full["Action_Type"] == a)]
+            if len(sub) >= 10:
+                dynamic_combos.append((s, a))
+# Also add "All-<action>" and "<suggestion>-All" combos
+for a in act_values:
+    if ("All", a) not in dynamic_combos:
+        dynamic_combos.append(("All", a))
+for s in sug_values:
+    if (s, "All") not in dynamic_combos:
+        dynamic_combos.append((s, "All"))
+
+combo_labels = [f"{s} - {a}" for s, a in dynamic_combos]
 selected_combo_label = st.sidebar.selectbox(
-    "Select combination to analyze",
+    "Suggestion - Action combination",
     combo_labels,
     index=0,
-    help="Filter data by Suggestion Type and Action Type pair",
+    help="Filter data by Suggestion Type and Action Type pair. 'All' means no filter on that dimension.",
 )
 selected_combo_idx = combo_labels.index(selected_combo_label)
-selected_suggestion, selected_action = VALID_COMBOS[selected_combo_idx]
+selected_suggestion, selected_action = dynamic_combos[selected_combo_idx]
 
-st.sidebar.markdown("---")
+# Outcome selector - dynamically based on available columns
+outcome_options = []
+if "Incremental_TRX" in df_full.columns:
+    outcome_options.append("TRX")
+if "Incremental_NBRX" in df_full.columns:
+    outcome_options.append("NBRX")
+if "Incremental_Actions" in df_full.columns:
+    outcome_options.append("Actions")
 
-# Outcome selector
-st.sidebar.markdown("### Outcome Variable")
+if not outcome_options:
+    st.error(
+        "No outcome columns found. Please map at least one of: "
+        "Incremental TRX, Incremental NBRX, or Incremental Actions."
+    )
+    st.stop()
+
 outcome_choice = st.sidebar.radio(
     "Incremental outcome to analyze",
-    ["TRX", "NBRX"],
+    outcome_options,
     index=0,
-    help="TRX = Total Prescriptions, NBRX = New-to-Brand Prescriptions",
+    help="TRX = Total Prescriptions, NBRX = New-to-Brand Prescriptions, Actions = Outreach action count",
 )
-outcome_col = f"Incremental_{outcome_choice}"
 
-st.sidebar.markdown("---")
+if outcome_choice == "Actions":
+    outcome_col = "Incremental_Actions"
+else:
+    outcome_col = f"Incremental_{outcome_choice}"
 
 # Analysis stage
-st.sidebar.markdown("### Analysis Stage")
+st.sidebar.markdown("---")
 analysis_stage = st.sidebar.radio(
-    "What to estimate",
+    "Analysis stage",
     ["Incremental Actions (Suggestions -> Actions)", "Incremental Outcomes (Actions -> Outcome)"],
     index=1,
 )
 
-st.sidebar.markdown("---")
-
 # Model configuration
-st.sidebar.markdown("### Model Settings")
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 4. Model Settings")
 causal_methods = st.sidebar.multiselect(
     "Causal methods",
     ["PSM", "IPW", "Doubly Robust", "S-Learner", "T-Learner"],
@@ -194,56 +502,37 @@ ps_model_type = st.sidebar.selectbox(
     index=0,
 )
 
-if data_source == "Synthetic Data":
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### Synthetic Data Settings")
-    n_records = st.sidebar.slider("Number of records", 2000, 20000, 8000, 1000)
-    seed = st.sidebar.number_input("Random seed", 1, 9999, 42)
+# ══════════════════════════════════════════════════════════════════════════════
+# APPLY FILTERS AND SET UP ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ── Load Data ────────────────────────────────────────────────────────────────
-
-@st.cache_data
-def load_synthetic(n_records, seed):
-    return generate_outreach_data(n_records=n_records, seed=seed)
-
-
-if data_source == "Upload CSV" and uploaded_file is not None:
-    df_full = pd.read_csv(uploaded_file)
-elif data_source == "Synthetic Data":
-    df_full = load_synthetic(n_records, seed)
-else:
-    df_full = load_synthetic(8000, 42)
-
-# Apply combo filter
 df = filter_by_combo(df_full, selected_suggestion, selected_action)
 
 # Determine treatment and covariates based on analysis stage
+treatment_col = "Suggestion_Accepted"
+
 if "Incremental Actions" in analysis_stage:
-    treatment_col = "Suggestion_Accepted"
+    if "Incremental_Actions" not in df.columns:
+        st.error("Incremental Actions column is required for Stage 1 analysis. Please map it in the sidebar.")
+        st.stop()
     outcome_display = "Incremental_Actions"
-    covariate_cols = [
-        "Rep_Experience_Years",
-        "Territory_Size",
-        "HCP_Specialty",
-        "HCP_Patient_Volume",
-        "HCP_Digital_Affinity",
-    ]
+    covariate_cols = [c for c in available_covariates if c != "Incremental_Actions"]
     stage_label = "Stage 1: Suggestions -> Incremental Actions"
     stage_description = "Estimating the causal effect of accepting a suggestion on the number of incremental outreach actions."
 else:
-    treatment_col = "Suggestion_Accepted"
     outcome_display = outcome_col
-    covariate_cols = [
-        "Rep_Experience_Years",
-        "Territory_Size",
-        "HCP_Specialty",
-        "HCP_Patient_Volume",
-        "HCP_Digital_Affinity",
-        "Incremental_Actions",
-    ]
+    if outcome_display not in df.columns:
+        st.error(f"Column '{outcome_display}' not found. Please map the {outcome_choice} column in the sidebar.")
+        st.stop()
+    covariate_cols = available_covariates.copy()
+    if "Incremental_Actions" in df.columns and "Incremental_Actions" not in covariate_cols:
+        covariate_cols.append("Incremental_Actions")
     stage_label = f"Stage 2: Actions -> Incremental {outcome_choice}"
     stage_description = f"Estimating the causal effect of acting on suggestions on incremental {outcome_choice} outcomes."
+
+# Ensure outcome column is numeric
+df[outcome_display] = pd.to_numeric(df[outcome_display], errors="coerce")
+df = df.dropna(subset=[outcome_display, treatment_col])
 
 # ── Header ───────────────────────────────────────────────────────────────────
 
@@ -287,7 +576,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 # ── TAB 1: Data Overview ────────────────────────────────────────────────────
 
 with tab1:
-    st.markdown(f"### Data Overview  —  {selected_suggestion} / {selected_action}")
+    st.markdown(f"### Data Overview  --  {selected_suggestion} / {selected_action}")
     st.markdown(stage_description)
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -337,30 +626,40 @@ with tab1:
         st.plotly_chart(fig_out, use_container_width=True)
 
     with col_b:
-        fig_spec = px.histogram(
-            df,
-            x="HCP_Specialty",
-            color=treatment_col,
-            barmode="group",
-            title="Treatment Distribution by HCP Specialty",
-            color_discrete_map={0: "#EF5350", 1: "#42A5F5"},
-        )
-        fig_spec.update_layout(height=350, margin=dict(t=40, b=20))
-        st.plotly_chart(fig_spec, use_container_width=True)
+        # Pick a useful categorical column for the second chart
+        cat_col = None
+        for candidate in ["HCP_Specialty", "Suggestion_Type", "Action_Type"]:
+            if candidate in df.columns and df[candidate].nunique() > 1:
+                cat_col = candidate
+                break
+        if cat_col is None:
+            for c in available_covariates:
+                if c in df.columns and (df[c].dtype == object or df[c].dtype.name == "category"):
+                    cat_col = c
+                    break
+
+        if cat_col:
+            fig_spec = px.histogram(
+                df,
+                x=cat_col,
+                color=treatment_col,
+                barmode="group",
+                title=f"Treatment Distribution by {cat_col}",
+                color_discrete_map={0: "#EF5350", 1: "#42A5F5"},
+            )
+            fig_spec.update_layout(height=350, margin=dict(t=40, b=20))
+            st.plotly_chart(fig_spec, use_container_width=True)
 
     st.markdown("#### Descriptive Statistics")
-    desc_cols = [
-        "Rep_Experience_Years", "Territory_Size", "HCP_Patient_Volume",
-        "HCP_Digital_Affinity", "Incremental_Actions",
-        "Incremental_TRX", "Incremental_NBRX",
-    ]
-    st.dataframe(df[desc_cols].describe().round(3), use_container_width=True)
+    numeric_cols = [c for c in df.columns if df[c].dtype in ("float64", "float32", "int64", "int32")]
+    if numeric_cols:
+        st.dataframe(df[numeric_cols].describe().round(3), use_container_width=True)
 
 
 # ── TAB 2: Naive Lift ───────────────────────────────────────────────────────
 
 with tab2:
-    st.markdown(f"### Naive (Unadjusted) Lift  —  {outcome_display}")
+    st.markdown(f"### Naive (Unadjusted) Lift  --  {outcome_display}")
 
     lift = compute_naive_lift(df, treatment_col, outcome_display)
 
@@ -415,7 +714,7 @@ with tab2:
 
     st.info(
         "**Note:** Naive lift does not adjust for confounders. Reps who accept suggestions "
-        "may systematically differ from those who don't. Use the Causal Estimates tab for "
+        "may systematically differ from those who don't. Use the **Causal Estimates** tab for "
         "adjusted estimates."
     )
 
@@ -423,105 +722,116 @@ with tab2:
 # ── TAB 3: Causal Estimates ─────────────────────────────────────────────────
 
 with tab3:
-    st.markdown(f"### Causal Lift Estimates  —  {outcome_display}")
+    st.markdown(f"### Causal Lift Estimates  --  {outcome_display}")
     st.markdown(stage_description)
 
     if not causal_methods:
         st.warning("Select at least one causal method in the sidebar.")
-        st.stop()
+    elif not covariate_cols:
+        st.warning(
+            "No covariates selected for confounding adjustment. "
+            "Please select covariate columns in the sidebar (Step 2)."
+        )
+    else:
+        estimates = []
+        cate_results = {}
 
-    estimates = []
-    cate_results = {}
+        with st.spinner("Running causal estimation methods..."):
+            method_map = {
+                "PSM": ("Propensity Score Matching", lambda: propensity_score_matching(
+                    df, treatment_col, outcome_display, covariate_cols, ps_model_type
+                )),
+                "IPW": ("Inverse Propensity Weighting", lambda: inverse_propensity_weighting(
+                    df, treatment_col, outcome_display, covariate_cols, ps_model_type
+                )),
+                "Doubly Robust": ("Doubly Robust (AIPW)", lambda: doubly_robust(
+                    df, treatment_col, outcome_display, covariate_cols, ps_model_type
+                )),
+                "S-Learner": ("S-Learner", lambda: s_learner(
+                    df, treatment_col, outcome_display, covariate_cols
+                )),
+                "T-Learner": ("T-Learner", lambda: t_learner(
+                    df, treatment_col, outcome_display, covariate_cols
+                )),
+            }
 
-    with st.spinner("Running causal estimation methods..."):
-        method_map = {
-            "PSM": ("Propensity Score Matching", lambda: propensity_score_matching(
-                df, treatment_col, outcome_display, covariate_cols, ps_model_type
-            )),
-            "IPW": ("Inverse Propensity Weighting", lambda: inverse_propensity_weighting(
-                df, treatment_col, outcome_display, covariate_cols, ps_model_type
-            )),
-            "Doubly Robust": ("Doubly Robust (AIPW)", lambda: doubly_robust(
-                df, treatment_col, outcome_display, covariate_cols, ps_model_type
-            )),
-            "S-Learner": ("S-Learner", lambda: s_learner(
-                df, treatment_col, outcome_display, covariate_cols
-            )),
-            "T-Learner": ("T-Learner", lambda: t_learner(
-                df, treatment_col, outcome_display, covariate_cols
-            )),
-        }
+            for method_key in causal_methods:
+                label, fn = method_map[method_key]
+                result = fn()
+                if isinstance(result, tuple):
+                    est, cate = result
+                    estimates.append(est)
+                    cate_results[method_key] = cate
+                else:
+                    estimates.append(result)
 
-        for method_key in causal_methods:
-            label, fn = method_map[method_key]
-            result = fn()
-            if isinstance(result, tuple):
-                est, cate = result
-                estimates.append(est)
-                cate_results[method_key] = cate
-            else:
-                estimates.append(result)
+        # Summary table
+        est_rows = []
+        for e in estimates:
+            est_rows.append({
+                "Method": e.method,
+                "ATE": round(e.ate, 4),
+                "Std Error": round(e.ate_se, 4),
+                "95% CI Lower": round(e.ci_lower, 4),
+                "95% CI Upper": round(e.ci_upper, 4),
+                "P-Value": round(e.p_value, 4),
+                "Significant": "Yes" if e.p_value < 0.05 else "No",
+                "N Treated": e.n_treated,
+                "N Control": e.n_control,
+            })
+        est_df = pd.DataFrame(est_rows)
+        st.dataframe(est_df, use_container_width=True, hide_index=True)
 
-    # Summary table
-    est_rows = []
-    for e in estimates:
-        est_rows.append({
-            "Method": e.method,
-            "ATE": round(e.ate, 4),
-            "Std Error": round(e.ate_se, 4),
-            "95% CI Lower": round(e.ci_lower, 4),
-            "95% CI Upper": round(e.ci_upper, 4),
-            "P-Value": round(e.p_value, 4),
-            "Significant": "Yes" if e.p_value < 0.05 else "No",
-            "N Treated": e.n_treated,
-            "N Control": e.n_control,
-        })
-    est_df = pd.DataFrame(est_rows)
-    st.dataframe(est_df, use_container_width=True, hide_index=True)
+        st.markdown("---")
 
-    st.markdown("---")
+        # Forest plot
+        fig_forest = go.Figure()
+        for i, e in enumerate(estimates):
+            color = "#2E7D32" if e.p_value < 0.05 else "#C62828"
+            fig_forest.add_trace(go.Scatter(
+                x=[e.ci_lower, e.ate, e.ci_upper],
+                y=[e.method] * 3,
+                mode="lines+markers",
+                marker=dict(size=[8, 14, 8], color=color),
+                line=dict(color=color, width=3),
+                name=e.method,
+                showlegend=False,
+                hovertemplate=(
+                    f"<b>{e.method}</b><br>ATE: {e.ate:.4f}<br>"
+                    f"CI: [{e.ci_lower:.4f}, {e.ci_upper:.4f}]<br>"
+                    f"p: {e.p_value:.4f}<extra></extra>"
+                ),
+            ))
 
-    # Forest plot
-    fig_forest = go.Figure()
-    for i, e in enumerate(estimates):
-        color = "#2E7D32" if e.p_value < 0.05 else "#C62828"
-        fig_forest.add_trace(go.Scatter(
-            x=[e.ci_lower, e.ate, e.ci_upper],
-            y=[e.method] * 3,
-            mode="lines+markers",
-            marker=dict(size=[8, 14, 8], color=color),
-            line=dict(color=color, width=3),
-            name=e.method,
-            showlegend=False,
-            hovertemplate=f"<b>{e.method}</b><br>ATE: {e.ate:.4f}<br>CI: [{e.ci_lower:.4f}, {e.ci_upper:.4f}]<br>p: {e.p_value:.4f}<extra></extra>",
-        ))
-
-    fig_forest.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
-    fig_forest.update_layout(
-        title="Forest Plot: Causal Effect Estimates (95% CI)",
-        xaxis_title=f"Average Treatment Effect on {outcome_display}",
-        height=max(250, 80 * len(estimates)),
-        margin=dict(l=200, t=40, b=40),
-    )
-    st.plotly_chart(fig_forest, use_container_width=True)
+        fig_forest.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
+        fig_forest.update_layout(
+            title="Forest Plot: Causal Effect Estimates (95% CI)",
+            xaxis_title=f"Average Treatment Effect on {outcome_display}",
+            height=max(250, 80 * len(estimates)),
+            margin=dict(l=200, t=40, b=40),
+        )
+        st.plotly_chart(fig_forest, use_container_width=True)
 
 
 # ── TAB 4: Heterogeneous Effects (CATE) ─────────────────────────────────────
 
 with tab4:
-    st.markdown(f"### Heterogeneous Treatment Effects  —  {outcome_display}")
+    st.markdown(f"### Heterogeneous Treatment Effects  --  {outcome_display}")
 
-    if not cate_results:
+    # cate_results may not be defined if tab3 had warnings
+    _cate_results = cate_results if "cate_results" in dir() else {}
+
+    if not _cate_results:
         st.info(
-            "CATE analysis requires S-Learner or T-Learner. "
-            "Enable them in the sidebar under Causal Methods."
+            "CATE analysis requires **S-Learner** or **T-Learner**. "
+            "Enable them in the sidebar under Causal Methods, and ensure covariates are selected."
         )
     else:
         cate_method = st.selectbox(
             "Select CATE method",
-            list(cate_results.keys()),
+            list(_cate_results.keys()),
         )
-        cate = cate_results[cate_method]
+        cate = _cate_results[cate_method]
         preds = cate.cate_predictions
 
         col1, col2, col3 = st.columns(3)
@@ -535,7 +845,6 @@ with tab4:
 
         st.markdown("---")
 
-        # CATE distribution
         col_l, col_r = st.columns(2)
         with col_l:
             fig_cate = px.histogram(
@@ -549,7 +858,6 @@ with tab4:
             st.plotly_chart(fig_cate, use_container_width=True)
 
         with col_r:
-            # Uplift curve
             uplift_df = compute_uplift_curve(
                 df[outcome_display].values,
                 df[treatment_col].values,
@@ -565,7 +873,6 @@ with tab4:
 
         st.markdown("---")
 
-        # Qini curve and decile analysis
         col_q, col_d = st.columns(2)
         with col_q:
             qini_df = compute_qini_curve(
@@ -614,14 +921,17 @@ with tab4:
 # ── TAB 5: Segment Analysis ─────────────────────────────────────────────────
 
 with tab5:
-    st.markdown(f"### Segment-Level Lift  —  {outcome_display}")
+    st.markdown(f"### Segment-Level Lift  --  {outcome_display}")
 
-    segment_options = ["HCP_Specialty", "Suggestion_Type", "Action_Type"]
-    # Only show segment options that have >1 unique value in filtered data
-    segment_options = [s for s in segment_options if df[s].nunique() > 1]
+    # Build segment options from categorical columns in the data
+    segment_options = []
+    for c in ["HCP_Specialty", "Suggestion_Type", "Action_Type"] + available_covariates:
+        if c in df.columns and (df[c].dtype == object or df[c].dtype.name == "category"):
+            if df[c].nunique() > 1 and c not in segment_options:
+                segment_options.append(c)
 
     if not segment_options:
-        st.info("No segmentation variables available with multiple values in the filtered data.")
+        st.info("No categorical segmentation variables found in the data.")
     else:
         segment_col = st.selectbox("Segment by", segment_options)
 
@@ -678,10 +988,10 @@ with tab5:
     # Cross-combo comparison
     st.markdown("---")
     st.markdown("### Cross-Combination Comparison")
-    st.markdown("Compare lift across all valid suggestion-action combinations.")
+    st.markdown("Compare naive lift across all valid suggestion-action combinations in your data.")
 
     cross_results = []
-    for sug, act in VALID_COMBOS:
+    for sug, act in dynamic_combos:
         sub = filter_by_combo(df_full, sug, act)
         if len(sub) >= 30 and sub[treatment_col].nunique() == 2:
             lift_r = compute_naive_lift(sub, treatment_col, outcome_display)
@@ -724,114 +1034,122 @@ with tab5:
 with tab6:
     st.markdown("### Propensity Score Diagnostics")
 
-    X = encode_features(df, covariate_cols)
-    treatment = df[treatment_col].values
+    if not covariate_cols:
+        st.warning("Select covariates in the sidebar to run propensity score diagnostics.")
+    else:
+        X = encode_features(df, covariate_cols)
+        treatment = df[treatment_col].values
 
-    with st.spinner("Estimating propensity scores..."):
-        ps = estimate_propensity_scores(X, treatment, ps_model_type)
+        with st.spinner("Estimating propensity scores..."):
+            ps = estimate_propensity_scores(X, treatment, ps_model_type)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        fig_ps = go.Figure()
-        fig_ps.add_trace(go.Histogram(
-            x=ps[treatment == 1],
-            name="Treated",
-            marker_color="#42A5F5",
-            opacity=0.7,
-            nbinsx=40,
-        ))
-        fig_ps.add_trace(go.Histogram(
-            x=ps[treatment == 0],
-            name="Control",
-            marker_color="#EF5350",
-            opacity=0.7,
-            nbinsx=40,
-        ))
-        fig_ps.update_layout(
-            title="Propensity Score Distribution",
-            xaxis_title="Propensity Score",
-            yaxis_title="Count",
-            barmode="overlay",
-            height=400,
-            margin=dict(t=40, b=20),
-        )
-        st.plotly_chart(fig_ps, use_container_width=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            fig_ps = go.Figure()
+            fig_ps.add_trace(go.Histogram(
+                x=ps[treatment == 1],
+                name="Treated",
+                marker_color="#42A5F5",
+                opacity=0.7,
+                nbinsx=40,
+            ))
+            fig_ps.add_trace(go.Histogram(
+                x=ps[treatment == 0],
+                name="Control",
+                marker_color="#EF5350",
+                opacity=0.7,
+                nbinsx=40,
+            ))
+            fig_ps.update_layout(
+                title="Propensity Score Distribution",
+                xaxis_title="Propensity Score",
+                yaxis_title="Count",
+                barmode="overlay",
+                height=400,
+                margin=dict(t=40, b=20),
+            )
+            st.plotly_chart(fig_ps, use_container_width=True)
 
-    with col2:
-        fig_box = go.Figure()
-        fig_box.add_trace(go.Box(
-            x=["Control"] * int(np.sum(treatment == 0)) + ["Treated"] * int(np.sum(treatment == 1)),
-            y=np.concatenate([ps[treatment == 0], ps[treatment == 1]]),
-            marker_color="#667eea",
-        ))
-        fig_box.update_layout(
-            title="Propensity Score Box Plot",
-            yaxis_title="Propensity Score",
-            height=400,
-            margin=dict(t=40, b=20),
-        )
-        st.plotly_chart(fig_box, use_container_width=True)
+        with col2:
+            fig_box = go.Figure()
+            fig_box.add_trace(go.Box(
+                x=(["Control"] * int(np.sum(treatment == 0))
+                   + ["Treated"] * int(np.sum(treatment == 1))),
+                y=np.concatenate([ps[treatment == 0], ps[treatment == 1]]),
+                marker_color="#667eea",
+            ))
+            fig_box.update_layout(
+                title="Propensity Score Box Plot",
+                yaxis_title="Propensity Score",
+                height=400,
+                margin=dict(t=40, b=20),
+            )
+            st.plotly_chart(fig_box, use_container_width=True)
 
-    # Overlap statistics
-    st.markdown("#### Overlap Statistics")
-    overlap_data = {
-        "Group": ["Treated", "Control"],
-        "N": [int(np.sum(treatment == 1)), int(np.sum(treatment == 0))],
-        "Mean PS": [round(np.mean(ps[treatment == 1]), 4), round(np.mean(ps[treatment == 0]), 4)],
-        "Median PS": [round(np.median(ps[treatment == 1]), 4), round(np.median(ps[treatment == 0]), 4)],
-        "Min PS": [round(np.min(ps[treatment == 1]), 4), round(np.min(ps[treatment == 0]), 4)],
-        "Max PS": [round(np.max(ps[treatment == 1]), 4), round(np.max(ps[treatment == 0]), 4)],
-    }
-    st.dataframe(pd.DataFrame(overlap_data), use_container_width=True, hide_index=True)
+        # Overlap statistics
+        st.markdown("#### Overlap Statistics")
+        overlap_data = {
+            "Group": ["Treated", "Control"],
+            "N": [int(np.sum(treatment == 1)), int(np.sum(treatment == 0))],
+            "Mean PS": [round(np.mean(ps[treatment == 1]), 4), round(np.mean(ps[treatment == 0]), 4)],
+            "Median PS": [round(np.median(ps[treatment == 1]), 4), round(np.median(ps[treatment == 0]), 4)],
+            "Min PS": [round(np.min(ps[treatment == 1]), 4), round(np.min(ps[treatment == 0]), 4)],
+            "Max PS": [round(np.max(ps[treatment == 1]), 4), round(np.max(ps[treatment == 0]), 4)],
+        }
+        st.dataframe(pd.DataFrame(overlap_data), use_container_width=True, hide_index=True)
 
-    # Standardized mean differences
-    st.markdown("#### Covariate Balance (Standardized Mean Differences)")
-    X_numeric = encode_features(df, covariate_cols)
-    smd_rows = []
-    feat_names = []
-    for col in covariate_cols:
-        if df[col].dtype == object or df[col].dtype.name == "category":
-            for val in sorted(df[col].unique())[1:]:
-                feat_names.append(f"{col}_{val}")
-        else:
-            feat_names.append(col)
+        # Standardized mean differences
+        st.markdown("#### Covariate Balance (Standardized Mean Differences)")
+        X_numeric = encode_features(df, covariate_cols)
+        smd_rows = []
+        feat_names = []
+        for c in covariate_cols:
+            if df[c].dtype == object or df[c].dtype.name == "category":
+                for val in sorted(df[c].unique())[1:]:
+                    feat_names.append(f"{c}_{val}")
+            else:
+                feat_names.append(c)
 
-    for i, fname in enumerate(feat_names):
-        if i < X_numeric.shape[1]:
-            t_vals = X_numeric[treatment == 1, i]
-            c_vals = X_numeric[treatment == 0, i]
-            pooled_sd = np.sqrt((np.var(t_vals) + np.var(c_vals)) / 2)
-            smd = (np.mean(t_vals) - np.mean(c_vals)) / pooled_sd if pooled_sd > 0 else 0
-            smd_rows.append({"Covariate": fname, "SMD": round(abs(smd), 4)})
+        for i, fname in enumerate(feat_names):
+            if i < X_numeric.shape[1]:
+                t_vals = X_numeric[treatment == 1, i]
+                c_vals = X_numeric[treatment == 0, i]
+                pooled_sd = np.sqrt((np.var(t_vals) + np.var(c_vals)) / 2)
+                smd = (np.mean(t_vals) - np.mean(c_vals)) / pooled_sd if pooled_sd > 0 else 0
+                smd_rows.append({"Covariate": fname, "SMD": round(abs(smd), 4)})
 
-    if smd_rows:
-        smd_df = pd.DataFrame(smd_rows)
-        fig_smd = go.Figure()
-        colors = ["#43A047" if v < 0.1 else "#FF9800" if v < 0.2 else "#EF5350" for v in smd_df["SMD"]]
-        fig_smd.add_trace(go.Bar(
-            x=smd_df["SMD"],
-            y=smd_df["Covariate"],
-            orientation="h",
-            marker_color=colors,
-        ))
-        fig_smd.add_vline(x=0.1, line_dash="dash", line_color="orange", annotation_text="0.1 threshold")
-        fig_smd.update_layout(
-            title="Standardized Mean Differences (|SMD|)",
-            xaxis_title="|SMD|",
-            height=max(300, 40 * len(smd_rows)),
-            margin=dict(l=200, t=40, b=20),
-        )
-        st.plotly_chart(fig_smd, use_container_width=True)
+        if smd_rows:
+            smd_df = pd.DataFrame(smd_rows)
+            fig_smd = go.Figure()
+            colors = [
+                "#43A047" if v < 0.1 else "#FF9800" if v < 0.2 else "#EF5350"
+                for v in smd_df["SMD"]
+            ]
+            fig_smd.add_trace(go.Bar(
+                x=smd_df["SMD"],
+                y=smd_df["Covariate"],
+                orientation="h",
+                marker_color=colors,
+            ))
+            fig_smd.add_vline(x=0.1, line_dash="dash", line_color="orange", annotation_text="0.1 threshold")
+            fig_smd.update_layout(
+                title="Standardized Mean Differences (|SMD|)",
+                xaxis_title="|SMD|",
+                height=max(300, 40 * len(smd_rows)),
+                margin=dict(l=200, t=40, b=20),
+            )
+            st.plotly_chart(fig_smd, use_container_width=True)
 
 
 # ── Footer ───────────────────────────────────────────────────────────────────
 
 st.markdown("---")
+data_label = "Uploaded" if not using_synthetic else "Synthetic"
 st.markdown(
     "<div style='text-align:center; color:#888; font-size:0.85rem;'>"
-    "Causal Inference HCP Outreach Model &nbsp;|&nbsp; "
-    f"Data: {len(df):,} records &nbsp;|&nbsp; "
-    f"Combination: {selected_suggestion}-{selected_action} &nbsp;|&nbsp; "
+    f"Causal Inference HCP Outreach Model &nbsp;|&nbsp; "
+    f"Data: {data_label} ({len(df):,} records) &nbsp;|&nbsp; "
+    f"Combo: {selected_suggestion}-{selected_action} &nbsp;|&nbsp; "
     f"Outcome: {outcome_choice}"
     "</div>",
     unsafe_allow_html=True,
