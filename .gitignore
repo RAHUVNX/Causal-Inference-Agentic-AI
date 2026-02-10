@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+.env
+*.log
+.DS_Store
+Thumbs.db
+.streamlit/secrets.toml
+*.csv
+!data/sample_outreach_data.csv
