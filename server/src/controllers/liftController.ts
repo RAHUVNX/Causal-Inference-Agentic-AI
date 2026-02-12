@@ -2,15 +2,15 @@
  * Lift Controller
  *
  * Handles the full counterfactual simulation pipeline:
- *   1. Fetch observations
- *   2. Run Refinery (feature engineering + train + simulate)
- *   3. Persist lift results
+ *   1. Fetch observations from database
+ *   2. Send to Python ML service for training + simulation
+ *   3. Persist lift results and model metadata
  *   4. Return incremental lift data
  */
 
 import { Request, Response } from 'express';
 import prisma from '../utils/prisma';
-import { Refinery } from '../services/refinery';
+import { callPythonRunLift } from '../utils/pythonService';
 import { RunConfigSchema } from '../utils/validation';
 
 export async function runLift(req: Request, res: Response): Promise<void> {
@@ -46,13 +46,41 @@ export async function runLift(req: Request, res: Response): Promise<void> {
       },
     });
 
-    // Run the full Refinery pipeline
-    const refinery = new Refinery();
+    // Convert observations for Python service
+    const obsPayload = observations.map((obs) => ({
+      hcpId: obs.hcpId,
+      month: obs.month.toISOString(),
+      suggestionType: obs.suggestionType,
+      actionType: obs.actionType,
+      outcomeType: obs.outcomeType,
+      suggestionCount: obs.suggestionCount,
+      actionCount: obs.actionCount,
+      outcomeCount: obs.outcomeCount,
+      specialtyCode: obs.specialtyCode,
+      regionCode: obs.regionCode,
+      tenureMonths: obs.tenureMonths,
+      priorTrx: obs.priorTrx,
+      priorNbrx: obs.priorNbrx,
+      totalSuggestions: obs.totalSuggestions,
+      theme: obs.theme,
+    }));
+
+    // Call Python ML service for full pipeline
     let pipelineOutput;
     try {
-      pipelineOutput = refinery.run(observations, config);
-    } catch (pipelineError) {
-      const msg = pipelineError instanceof Error ? pipelineError.message : 'Pipeline failed';
+      pipelineOutput = await callPythonRunLift({
+        observations: obsPayload,
+        filter: {
+          suggestionType: config.suggestionType,
+          actionType: config.actionType,
+          outcomeType: config.outcomeType,
+        },
+        adstockEnabled: config.adstockEnabled,
+        adstockDecay: config.adstockDecay,
+        theme: config.theme,
+      });
+    } catch (pyError: any) {
+      const msg = pyError.response?.data?.detail || pyError.message || 'Python ML service error';
       await prisma.modelRun.update({
         where: { runId },
         data: { status: 'failed', errorMessage: msg },
@@ -61,11 +89,11 @@ export async function runLift(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const { result, metrics } = pipelineOutput;
+    const { liftResults, monthlySummary, metrics, pathA: pathAResult, pathB: pathBResult } = pipelineOutput;
 
     // Persist lift results to database
     await prisma.liftResult.createMany({
-      data: result.liftResults.map((lr) => ({
+      data: liftResults.map((lr) => ({
         runId,
         hcpId: lr.hcpId,
         month: new Date(lr.month),
@@ -87,24 +115,24 @@ export async function runLift(req: Request, res: Response): Promise<void> {
     // Persist model metadata
     const pathAMeta = await prisma.modelMetadata.create({
       data: {
-        modelName: result.pathAModel.modelName,
+        modelName: pathAResult.modelName,
         modelType: 'linear_regression',
         suggestionType: config.suggestionType,
         actionType: config.actionType,
         outcomeType: config.outcomeType,
-        featureNames: result.pathAModel.featureNames,
-        coefficients: result.pathAModel.coefficients,
-        intercept: result.pathAModel.intercept,
-        scalerMeans: result.pathAModel.scalerState.means,
-        scalerStds: result.pathAModel.scalerState.stds,
-        categoricalMap: result.pathAModel.categoricalMap as object,
+        featureNames: pathAResult.featureNames,
+        coefficients: pathAResult.coefficients,
+        intercept: pathAResult.intercept,
+        scalerMeans: pathAResult.scalerMeans,
+        scalerStds: pathAResult.scalerStds,
+        categoricalMap: pathAResult.categoricalMap as object,
         runId,
       },
     });
 
     // Persist feature importance for Path A
     await prisma.featureImportance.createMany({
-      data: result.pathAModel.featureImportance.map((fi) => ({
+      data: pathAResult.featureImportance.map((fi) => ({
         modelMetadataId: pathAMeta.id,
         featureName: fi.featureName,
         importance: fi.importance,
@@ -114,24 +142,24 @@ export async function runLift(req: Request, res: Response): Promise<void> {
 
     const pathBMeta = await prisma.modelMetadata.create({
       data: {
-        modelName: result.pathBModel.modelName,
+        modelName: pathBResult.modelName,
         modelType: 'linear_regression',
         suggestionType: config.suggestionType,
         actionType: config.actionType,
         outcomeType: config.outcomeType,
-        featureNames: result.pathBModel.featureNames,
-        coefficients: result.pathBModel.coefficients,
-        intercept: result.pathBModel.intercept,
-        scalerMeans: result.pathBModel.scalerState.means,
-        scalerStds: result.pathBModel.scalerState.stds,
-        categoricalMap: result.pathBModel.categoricalMap as object,
+        featureNames: pathBResult.featureNames,
+        coefficients: pathBResult.coefficients,
+        intercept: pathBResult.intercept,
+        scalerMeans: pathBResult.scalerMeans,
+        scalerStds: pathBResult.scalerStds,
+        categoricalMap: pathBResult.categoricalMap as object,
         runId,
       },
     });
 
     // Persist feature importance for Path B
     await prisma.featureImportance.createMany({
-      data: result.pathBModel.featureImportance.map((fi) => ({
+      data: pathBResult.featureImportance.map((fi) => ({
         modelMetadataId: pathBMeta.id,
         featureName: fi.featureName,
         importance: fi.importance,
@@ -145,7 +173,7 @@ export async function runLift(req: Request, res: Response): Promise<void> {
       data: {
         status: 'completed',
         completedAt: new Date(),
-        totalObservations: result.liftResults.length,
+        totalObservations: liftResults.length,
         rSquaredPathA: metrics.pathA.rSquared,
         rSquaredPathB: metrics.pathB.rSquared,
         maePathA: metrics.pathA.mae,
@@ -155,15 +183,15 @@ export async function runLift(req: Request, res: Response): Promise<void> {
     });
 
     // Compute aggregate totals for the response
-    const totalIncrementalAction = result.liftResults.reduce(
+    const totalIncrementalAction = liftResults.reduce(
       (s, r) => s + r.incrementalAction,
       0
     );
-    const totalIncrementalOutcome = result.liftResults.reduce(
+    const totalIncrementalOutcome = liftResults.reduce(
       (s, r) => s + r.incrementalOutcome,
       0
     );
-    const totalCounterfactualAction = result.liftResults.reduce(
+    const totalCounterfactualAction = liftResults.reduce(
       (s, r) => s + r.counterfactualAction,
       0
     );
@@ -175,11 +203,11 @@ export async function runLift(req: Request, res: Response): Promise<void> {
     res.json({
       success: true,
       runId,
-      totalObservations: result.liftResults.length,
+      totalObservations: liftResults.length,
       totalIncrementalAction,
       totalIncrementalOutcome,
       overallLiftPercent,
-      monthlySummary: result.monthlySummary,
+      monthlySummary,
       metrics: {
         pathA: metrics.pathA,
         pathB: metrics.pathB,

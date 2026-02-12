@@ -2,16 +2,14 @@
  * Train Controller
  *
  * Handles model training requests. Fetches observations from the database,
- * runs feature engineering, trains Path A and Path B models, and persists
+ * sends them to the Python ML service for training, and persists
  * model metadata and feature importance.
  */
 
 import { Request, Response } from 'express';
 import prisma from '../utils/prisma';
-import { FeatureEngineer } from '../services/featureEngineer';
-import { PathAActionModel, PathBOutcomeModel } from '../services/models';
+import { callPythonTrain } from '../utils/pythonService';
 import { TrainRequestSchema } from '../utils/validation';
-import { FeatureEngineerConfig, TrainedModel } from '../utils/types';
 
 export async function trainModels(req: Request, res: Response): Promise<void> {
   try {
@@ -51,24 +49,41 @@ export async function trainModels(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // Feature engineering
-    const feConfig: FeatureEngineerConfig = {
-      filter: {
-        suggestionType: config.suggestionType,
-        actionType: config.actionType,
-        outcomeType: config.outcomeType,
-      },
-      adstockEnabled: config.adstockEnabled,
-      adstockDecay: config.adstockDecay,
-      theme: config.theme,
-    };
+    // Convert observations for Python service
+    const obsPayload = observations.map((obs) => ({
+      hcpId: obs.hcpId,
+      month: obs.month.toISOString(),
+      suggestionType: obs.suggestionType,
+      actionType: obs.actionType,
+      outcomeType: obs.outcomeType,
+      suggestionCount: obs.suggestionCount,
+      actionCount: obs.actionCount,
+      outcomeCount: obs.outcomeCount,
+      specialtyCode: obs.specialtyCode,
+      regionCode: obs.regionCode,
+      tenureMonths: obs.tenureMonths,
+      priorTrx: obs.priorTrx,
+      priorNbrx: obs.priorNbrx,
+      totalSuggestions: obs.totalSuggestions,
+      theme: obs.theme,
+    }));
 
-    const featureEngineer = new FeatureEngineer(feConfig);
-    let engineeringResult;
+    // Call Python ML service for training
+    let trainResult;
     try {
-      engineeringResult = featureEngineer.engineer(observations);
-    } catch (feError) {
-      const msg = feError instanceof Error ? feError.message : 'Feature engineering failed';
+      trainResult = await callPythonTrain({
+        observations: obsPayload,
+        filter: {
+          suggestionType: config.suggestionType,
+          actionType: config.actionType,
+          outcomeType: config.outcomeType,
+        },
+        adstockEnabled: config.adstockEnabled,
+        adstockDecay: config.adstockDecay,
+        theme: config.theme,
+      });
+    } catch (pyError: any) {
+      const msg = pyError.response?.data?.detail || pyError.message || 'Python ML service error';
       await prisma.modelRun.update({
         where: { runId },
         data: { status: 'failed', errorMessage: msg },
@@ -77,13 +92,7 @@ export async function trainModels(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const { rows, scalerState, categoricalMap, featureNames } = engineeringResult;
-
-    // Train Path A: Suggestion → Action
-    const pathAModel = new PathAActionModel();
-    const pathAResult: TrainedModel = pathAModel.train(rows);
-    pathAResult.scalerState = scalerState;
-    pathAResult.categoricalMap = categoricalMap;
+    const { pathA: pathAResult, pathB: pathBResult } = trainResult;
 
     // Persist Path A model metadata
     const pathAMeta = await prisma.modelMetadata.create({
@@ -93,12 +102,12 @@ export async function trainModels(req: Request, res: Response): Promise<void> {
         suggestionType: config.suggestionType,
         actionType: config.actionType,
         outcomeType: config.outcomeType,
-        featureNames,
+        featureNames: pathAResult.featureNames,
         coefficients: pathAResult.coefficients,
         intercept: pathAResult.intercept,
-        scalerMeans: scalerState.means,
-        scalerStds: scalerState.stds,
-        categoricalMap: categoricalMap as object,
+        scalerMeans: pathAResult.scalerMeans,
+        scalerStds: pathAResult.scalerStds,
+        categoricalMap: pathAResult.categoricalMap as object,
         runId,
       },
     });
@@ -113,12 +122,6 @@ export async function trainModels(req: Request, res: Response): Promise<void> {
       })),
     });
 
-    // Train Path B: Action → Outcome (TRX or NBRX)
-    const pathBModel = new PathBOutcomeModel(config.outcomeType);
-    const pathBResult: TrainedModel = pathBModel.train(rows);
-    pathBResult.scalerState = scalerState;
-    pathBResult.categoricalMap = categoricalMap;
-
     // Persist Path B model metadata
     const pathBMeta = await prisma.modelMetadata.create({
       data: {
@@ -127,12 +130,12 @@ export async function trainModels(req: Request, res: Response): Promise<void> {
         suggestionType: config.suggestionType,
         actionType: config.actionType,
         outcomeType: config.outcomeType,
-        featureNames,
+        featureNames: pathBResult.featureNames,
         coefficients: pathBResult.coefficients,
         intercept: pathBResult.intercept,
-        scalerMeans: scalerState.means,
-        scalerStds: scalerState.stds,
-        categoricalMap: categoricalMap as object,
+        scalerMeans: pathBResult.scalerMeans,
+        scalerStds: pathBResult.scalerStds,
+        categoricalMap: pathBResult.categoricalMap as object,
         runId,
       },
     });
@@ -153,7 +156,7 @@ export async function trainModels(req: Request, res: Response): Promise<void> {
       data: {
         status: 'completed',
         completedAt: new Date(),
-        totalObservations: rows.length,
+        totalObservations: observations.length,
         rSquaredPathA: pathAResult.rSquared,
         rSquaredPathB: pathBResult.rSquared,
         maePathA: pathAResult.mae,
@@ -165,18 +168,18 @@ export async function trainModels(req: Request, res: Response): Promise<void> {
     res.json({
       success: true,
       runId,
-      totalObservations: rows.length,
+      totalObservations: observations.length,
       pathA: {
         modelName: pathAResult.modelName,
         rSquared: pathAResult.rSquared,
         mae: pathAResult.mae,
-        featureCount: featureNames.length,
+        featureCount: pathAResult.featureNames.length,
       },
       pathB: {
         modelName: pathBResult.modelName,
         rSquared: pathBResult.rSquared,
         mae: pathBResult.mae,
-        featureCount: featureNames.length,
+        featureCount: pathBResult.featureNames.length,
       },
     });
   } catch (error) {
