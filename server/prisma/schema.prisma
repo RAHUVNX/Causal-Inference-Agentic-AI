@@ -1,0 +1,148 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────
+// Raw observation records ingested from CSV uploads.
+// Each row represents one HCP-month observation with
+// suggestion, action, and outcome counts.
+// ─────────────────────────────────────────────────────────
+model Observation {
+  id               Int      @id @default(autoincrement())
+  hcpId            String   @map("hcp_id")
+  month            DateTime
+  suggestionType   String   @map("suggestion_type")
+  actionType       String   @map("action_type")
+  outcomeType      String   @map("outcome_type") // "trx" or "nbrx"
+  suggestionCount  Float    @map("suggestion_count")
+  actionCount      Float    @map("action_count")
+  outcomeCount     Float    @map("outcome_count") // TRX or NBRX value
+  // Additional features from CSV
+  specialtyCode    String?  @map("specialty_code")
+  regionCode       String?  @map("region_code")
+  tenureMonths     Float?   @map("tenure_months")
+  priorTrx         Float?   @map("prior_trx")
+  priorNbrx        Float?   @map("prior_nbrx")
+  totalSuggestions Float?   @map("total_suggestions")
+  theme            String?
+  uploadBatchId    String   @map("upload_batch_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@map("observations")
+}
+
+// ─────────────────────────────────────────────────────────
+// Metadata for each trained model (Path A or Path B).
+// Stores serialized coefficients, feature list, and
+// training configuration.
+// ─────────────────────────────────────────────────────────
+model ModelMetadata {
+  id                Int      @id @default(autoincrement())
+  modelName         String   @map("model_name") // "PathA_Action" | "PathB_TRX" | "PathB_NBRX"
+  modelType         String   @map("model_type") // "linear_regression" | "gradient_boosting"
+  suggestionType    String   @map("suggestion_type")
+  actionType        String   @map("action_type")
+  outcomeType       String?  @map("outcome_type")
+  featureNames      String[] @map("feature_names")
+  coefficients      Json     // Serialized model weights / tree params
+  intercept         Float    @default(0)
+  scalerMeans       Json?    @map("scaler_means")
+  scalerStds        Json?    @map("scaler_stds")
+  categoricalMap    Json?    @map("categorical_map")
+  trainedAt         DateTime @default(now()) @map("trained_at")
+  runId             String   @map("run_id")
+
+  // Relations
+  runs              ModelRun[]
+  featureImportance FeatureImportance[]
+
+  @@map("model_metadata")
+}
+
+// ─────────────────────────────────────────────────────────
+// History of model training + lift simulation runs.
+// Each run captures configuration, timing, and status.
+// ─────────────────────────────────────────────────────────
+model ModelRun {
+  id               Int       @id @default(autoincrement())
+  runId            String    @unique @map("run_id")
+  status           String    @default("pending") // "pending" | "training" | "simulating" | "completed" | "failed"
+  suggestionType   String    @map("suggestion_type")
+  actionType       String    @map("action_type")
+  outcomeType      String    @map("outcome_type")
+  adstockEnabled   Boolean   @default(false) @map("adstock_enabled")
+  adstockDecay     Float?    @map("adstock_decay")
+  theme            String?
+  // Aggregate metrics
+  totalObservations Int?     @map("total_observations")
+  rSquaredPathA    Float?    @map("r_squared_path_a")
+  rSquaredPathB    Float?    @map("r_squared_path_b")
+  maePathA         Float?    @map("mae_path_a")
+  maePathB         Float?    @map("mae_path_b")
+  startedAt        DateTime  @default(now()) @map("started_at")
+  completedAt      DateTime? @map("completed_at")
+  errorMessage     String?   @map("error_message")
+
+  modelMetadataId  Int?      @map("model_metadata_id")
+  modelMetadata    ModelMetadata? @relation(fields: [modelMetadataId], references: [id])
+  liftResults      LiftResult[]
+
+  @@map("model_runs")
+}
+
+// ─────────────────────────────────────────────────────────
+// Per-HCP-month lift results from the counterfactual
+// simulation. Stores both predicted and counterfactual
+// values for the two-path causal framework.
+// ─────────────────────────────────────────────────────────
+model LiftResult {
+  id                        Int      @id @default(autoincrement())
+  runId                     String   @map("run_id")
+  hcpId                     String   @map("hcp_id")
+  month                     DateTime
+  suggestionType            String   @map("suggestion_type")
+  actionType                String   @map("action_type")
+  outcomeType               String   @map("outcome_type")
+  theme                     String?
+
+  // Path A outputs
+  predictedAction           Float    @map("predicted_action")
+  counterfactualAction      Float    @map("counterfactual_action")
+  incrementalAction         Float    @map("incremental_action")
+
+  // Path B outputs
+  predictedOutcome          Float    @map("predicted_outcome")
+  counterfactualOutcome     Float    @map("counterfactual_outcome")
+  incrementalOutcome        Float    @map("incremental_outcome")
+
+  // Observed values for comparison
+  observedAction            Float    @map("observed_action")
+  observedOutcome           Float    @map("observed_outcome")
+
+  createdAt                 DateTime @default(now()) @map("created_at")
+
+  modelRun                  ModelRun @relation(fields: [runId], references: [runId])
+
+  @@map("lift_results")
+}
+
+// ─────────────────────────────────────────────────────────
+// Feature importance rankings extracted from trained models.
+// ─────────────────────────────────────────────────────────
+model FeatureImportance {
+  id              Int      @id @default(autoincrement())
+  modelMetadataId Int      @map("model_metadata_id")
+  featureName     String   @map("feature_name")
+  importance      Float
+  rank            Int
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  modelMetadata   ModelMetadata @relation(fields: [modelMetadataId], references: [id])
+
+  @@map("feature_importance")
+}
